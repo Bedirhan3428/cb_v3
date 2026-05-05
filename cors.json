@@ -1,0 +1,21 @@
+[
+    {
+        "origin": [
+            "https://cloudbackup.vercel.app",
+            "http://localhost:5173"
+        ],
+        "method": [
+            "GET",
+            "POST",
+            "PUT",
+            "DELETE",
+            "HEAD"
+        ],
+        "responseHeader": [
+            "Content-Type",
+            "Authorization",
+            "x-goog-resumable"
+        ],
+        "maxAgeSeconds": 3600
+    }
+]

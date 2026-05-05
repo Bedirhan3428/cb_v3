@@ -1,0 +1,31 @@
+# Common
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Build outputs
+dist/
+build/
+out/
+
+# Dependencies
+node_modules/
+__pycache__/
+.venv/
+env/
+venv/
