@@ -24,10 +24,11 @@ function authenticate(req, res) {
     return true;
   }
 
-  // 2. Zaman bazlı dinamik TOTP doğrulama (+/- 1 dakika esneklik ile)
+  // 2. Zaman bazlı dinamik TOTP doğrulama (+/- 10 dakika esneklik ile)
+  // Windows bilgisayarların saatleri sık sık 5-10 dk senkronizasyon dışı kalabildiği için genişlettik.
   const currentMinute = Math.floor(Date.now() / 1000 / 60);
   const validTokens = [];
-  for (let i = -1; i <= 1; i++) {
+  for (let i = -10; i <= 10; i++) {
     const tokenString = `${AGENT_TOKEN}_${currentMinute + i}`;
     const validToken = crypto.createHash('sha256').update(tokenString).digest('hex');
     validTokens.push(validToken);
@@ -52,7 +53,7 @@ function checkRateLimit(req, res) {
   return true;
 }
 
-exports.api = functions.https.onRequest((req, res) => {
+exports.api = functions.https.onRequest(async (req, res) => {
   if (!authenticate(req, res)) return;
   if (!checkRateLimit(req, res)) return;
 
@@ -158,6 +159,77 @@ exports.api = functions.https.onRequest((req, res) => {
       level, message, source, ts
     }).then(() => res.json({ ok: true }))
       .catch(err => res.status(500).json({ error: err.message }));
+  }
+  else if (req.method === "POST" && req.path === "/log_batch") {
+    const { key, logs, source } = req.body;
+    if (!key || !logs || !Array.isArray(logs)) return res.status(400).json({ error: "Missing key or logs" });
+    
+    const batch = db.batch();
+    const colRef = db.collection(`accounts/${key}/logs`);
+    logs.forEach(log => {
+      const docRef = colRef.doc();
+      batch.set(docRef, {
+        level: log.level || 'info',
+        message: log.text || log.message || '',
+        source: source || 'agent',
+        ts: log.ts || Date.now()
+      });
+    });
+    
+    batch.commit()
+      .then(() => res.json({ ok: true, count: logs.length }))
+      .catch(err => res.status(500).json({ error: err.message }));
+  }
+  else if (req.method === "POST" && req.path === "/get_upload_url") {
+    const metadata = req.body.metadata;
+    if (!metadata || !metadata.key || !metadata.path) {
+      return res.status(400).json({ error: "Missing metadata or path" });
+    }
+
+    const { key, path, name, size, in_zip, encrypted_aes_key, zip_name, machine, original_path, backup_time, ext, bucket: targetBucket } = metadata;
+
+    try {
+      const bucket = targetBucket ? storage.bucket(targetBucket) : storage.bucket();
+      const file = bucket.file(path);
+
+      // Generate a Signed URL for PUT
+      const [uploadUrl] = await file.getSignedUrl({
+        version: 'v4',
+        action: 'write',
+        expires: Date.now() + 15 * 60 * 1000, // 15 mins
+        contentType: 'application/octet-stream'
+      });
+
+      // Save metadata to Firestore beforehand
+      const docId = Buffer.from(path).toString("base64").replace(/\//g, "_").replace(/\+/g, "-");
+      await db.doc(`accounts/${key}/files/${docId}`).set({
+        name, 
+        path, 
+        size, 
+        in_zip: false, // It's the zip itself
+        encrypted_aes_key, 
+        machine, 
+        original_path: metadata.original_path || name, 
+        backup_time: backup_time || new Date().toISOString(), 
+        ext: ".zip", 
+        updated: new Date().toISOString(),
+        file_count: metadata.original_files ? metadata.original_files.length : 1
+      });
+
+      const statsRef = db.doc(`accounts/${key}/data/stats`);
+      const statsSnap = await statsRef.get();
+      const currentStats = statsSnap.exists ? statsSnap.data() : { files_uploaded: 0, bytes_uploaded: 0 };
+      
+      await statsRef.set({
+        files_uploaded: (currentStats.files_uploaded || 0) + 1,
+        bytes_uploaded: (currentStats.bytes_uploaded || 0) + (size || 0),
+        last_upload: new Date().toISOString()
+      }, { merge: true });
+
+      res.json({ ok: true, uploadUrl });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
   }
   else if (req.method === "POST" && req.path === "/upload") {
     const bb = busboy({ headers: req.headers });

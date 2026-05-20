@@ -21,12 +21,26 @@ export default {
     
     // Worker'ın kendi path'ini Firebase backend'e yönlendir
     // Örn: /heartbeat -> https://us-central1-sigalmedia.cloudfunctions.net/api/heartbeat
-    const targetUrl = FIREBASE_BACKEND + url.pathname + url.search;
+    let targetUrl = FIREBASE_BACKEND + url.pathname + url.search;
+
+    // Eğer Ajan, "X-Proxy-Target" başlığı gönderirse, Firebase'e değil doğrudan bu URL'ye yönlendir
+    // Bu, Storage Signed URL için devasa dosyaları (100MB'a kadar) engelsiz aktarmamızı sağlar.
+    const proxyTarget = request.headers.get("X-Proxy-Target");
+    if (proxyTarget) {
+      targetUrl = proxyTarget;
+    }
+
+    const newHeaders = new Headers(request.headers);
+    newHeaders.delete("X-Proxy-Target"); // Storage'a gereksiz başlığı yollama
+    newHeaders.delete("Host"); // Host başlığı hedef URL'ye göre otomatik ayarlansın
+    if (proxyTarget) {
+      newHeaders.delete("Authorization"); // GCS, hem Signed URL hem Authorization başlığını aynı anda kabul etmez (400 Bad Request verir)
+    }
 
     // Orijinal isteğin tüm header, method ve body'sini koru
     const modifiedRequest = new Request(targetUrl, {
       method: request.method,
-      headers: request.headers,
+      headers: newHeaders,
       body: request.body,
       redirect: "follow",
     });
