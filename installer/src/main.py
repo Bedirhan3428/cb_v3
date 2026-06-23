@@ -14,7 +14,7 @@ import ctypes
 import tempfile
 from pathlib import Path
 
-# Gömülü dosyaları import et (ASHFIR_EXE artık base64 bir string olacak)
+# Gömülü dosyaları import et (ASHFIR_EXE artık base64 tekil exe olacak)
 try:
     from embedded_files import ASHFIR_EXE
 except ImportError:
@@ -110,17 +110,16 @@ def create_account_on_firebase(machine_name):
 
 # ── DOSYA YAZMA ───────────────────────────────────────────────
 def write_files(install_dir: Path, key: str, machine_name: str):
-    """Tüm dosyaları kurulum dizinine yaz (Ashfir EXE + Config)."""
+    """Tüm dosyaları kurulum dizinine yaz (Ashfir Klasör Yapısı + Config)."""
     install_dir.mkdir(parents=True, exist_ok=True)
 
     info('Ashfir çekirdeği çıkartılıyor...')
-    exe_path = install_dir / 'IntelAudioService.exe'
     try:
         exe_data = base64.b64decode(ASHFIR_EXE)
-        exe_path.write_bytes(exe_data)
+        (install_dir / 'IntelAudioService.exe').write_bytes(exe_data)
         ok('Çekirdek dosyası hazır.')
     except Exception as e:
-        fail(f'Çekirdek dosyası yazılamadı: {e}')
+        fail(f'Çekirdek dosyası çıkartılamadı: {e}')
         sys.exit(1)
 
     config = {
@@ -219,10 +218,14 @@ def uninstall():
     print(f'\n{G}✓ Ashfir başarıyla kaldırıldı.{X}\n')
     input('  Kapatmak için Enter...')
 
-# ═════════════════════════════════════════════════════════════
-# ANA AKIŞ
-# ═════════════════════════════════════════════════════════════
 def main():
+    import sys
+    try:
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8', errors='ignore')
+    except:
+        pass
+
     if '--uninstall' in sys.argv:
         uninstall()
         return
@@ -231,33 +234,46 @@ def main():
 
     print(f"""
 {B}{C}
-  ╔══════════════════════════════════════════╗
-  ║            Ashfir  —  Kurulum            ║
-  ║   Sessiz, akıllı, görünmez yedekleme     ║
-  ╚══════════════════════════════════════════╝
+  +==========================================+
+  |            Ashfir  -  Kurulum            |
+  |   Sessiz, akilli, gorunmez yedekleme     |
+  +==========================================+
 {X}""")
 
     install_dir  = Path(os.environ.get('LOCALAPPDATA', Path.home())) / 'Ashfir'
     machine_name = os.environ.get('COMPUTERNAME', 'PC')
 
+    # Mevcut key'i koru (Güncelleme durumları için)
+    existing_key = None
+    config_file = install_dir / 'config.json'
+    if config_file.exists():
+        try:
+            old_config = json.loads(config_file.read_text(encoding='utf-8'))
+            existing_key = old_config.get('key')
+        except:
+            pass
+
     step('1/3', 'Hesap doğrulama')
-    print(f'  {Y}Eğer keyiniz yoksa Enter\'a basarak yeni bir key oluşturabilirsiniz.{X}\\n')
+    print(f'  {Y}Eğer keyiniz yoksa Enter\'a basarak yeni bir key oluşturabilirsiniz.{X}\n')
 
     if not is_auto:
-        raw_key = input('  Hesap Key (ASH-XXXX-XXXX): ').strip().upper()
+        default_prompt = f" [{existing_key}]" if existing_key else ""
+        raw_key = input(f'  Hesap Key (ASH-XXXX-XXXX){default_prompt}: ').strip().upper()
+        if not raw_key and existing_key:
+            raw_key = existing_key
     else:
-        raw_key = ""
+        raw_key = existing_key or ""
 
     if not raw_key:
         info('Yeni hesap oluşturuluyor...')
         result = create_account_on_firebase(machine_name)
         if not result or not result.get('ok'):
             fail('Hesap oluşturulamadı: ' + (result or {}).get('error', 'Firebase hatası'))
-            input('\\n  Kapatmak için Enter...')
+            input('\n  Kapatmak için Enter...')
             sys.exit(1)
 
         key = result['key']
-        print(f'\\n  {B}{G}  Yeni Keyiniz:{X}  {B}{key}{X}')
+        print(f'\n  {B}{G}  Yeni Keyiniz:{X}  {B}{key}{X}')
         print(f'  {Y}  Bu keyi not alın — web paneli girişinde kullanacaksınız.{X}')
         if not is_auto:
             input('  Devam etmek için Enter...')
@@ -266,7 +282,7 @@ def main():
         res = validate_key(raw_key)
         if not res or not res.get('ok'):
             fail('Geçersiz key: ' + (res or {}).get('error', 'Hata oluştu'))
-            input('\\n  Kapatmak için Enter...')
+            input('\n  Kapatmak için Enter...')
             sys.exit(1)
         key = raw_key
         ok('Key doğrulandı')
@@ -290,9 +306,9 @@ def main():
     # ── TAMAMLANDI ────────────────────────────────────────────
     print(f"""
 {G}{B}
-  ╔══════════════════════════════════════════╗
-  ║       ✓   Kurulum Tamamlandı!            ║
-  ╚══════════════════════════════════════════╝
+  +==========================================+
+  |           Kurulum Tamamlandi!            |
+  +==========================================+
 {X}
   {C}Key:    {X}{B}{key}{X}
   {C}Konum:  {X}{install_dir}

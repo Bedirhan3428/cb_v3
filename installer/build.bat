@@ -40,7 +40,7 @@ echo        Kullanilan: %PY_CMD%
 
 :: Gerekli kütüphaneleri yükle
 echo  [2/4] Bagimliliklar yukleniyor...
-%PY_CMD% -m pip install watchdog groq requests certifi pycryptodome psutil PyInstaller pyarmor --quiet --disable-pip-version-check
+%PY_CMD% -m pip install watchdog groq requests certifi pycryptodome PyInstaller pyarmor --quiet --disable-pip-version-check
 if %ERRORLEVEL% neq 0 ( echo  [HATA] Kutuphane yuklemesi basarisiz! & pause & exit /b 1 )
 
 :: 1. AŞAMA: AGENT BUILD
